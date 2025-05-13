@@ -10,7 +10,9 @@ python3 gb28181_pusher.py \
     --server-ip 192.168.1.100 --server-port 5060 \
     --server-id 11009000000000000000 --domain 1100900000 \
     --agent-id 300000000010000000000 --agent-password 000000 \
-    --channel-id 340000000000000000000 --verbose
+    --channel-id 340000000000000000000 \
+    --source "rtsp://admin:admin@192.168.111.222/h264/ch1/main/av_stream" \
+    --verbose
 
 """
 from __future__ import annotations
@@ -20,6 +22,7 @@ import hashlib
 import logging
 import random
 import re
+import shlex
 import socket
 import subprocess
 import threading
@@ -81,6 +84,7 @@ class GB28181Pusher(AbstractContextManager):
         agent_id: str,
         agent_password: str,
         channel_id: str,
+        source: str = "test",
         use_udp_signalling: bool = False,
         local_ip: Optional[str] = None,
         verbose: bool = False,
@@ -90,6 +94,7 @@ class GB28181Pusher(AbstractContextManager):
         self.server_id: str = server_id
         self.domain: str = domain or server_id[:10]
         self.agent_id: str = agent_id
+        self.source: str = source
         self.agent_password: str = agent_password
         self.channel_id: str = channel_id
         self.use_udp_signalling: bool = use_udp_signalling
@@ -121,7 +126,7 @@ class GB28181Pusher(AbstractContextManager):
         self._open_signalling_socket()
         self._register()  # raises on failure
         self._start_heartbeat()
-        LOGGER.info("Ready — waiting for INVITE/SUBSCRIBE/etc …")
+        LOGGER.info("Ready — waiting for INVITE/SUBSCRIBE")
         self._event_loop()
 
     # Context‑manager helpers so callers can ``with GB28181Pusher(...):``
@@ -488,51 +493,24 @@ class GB28181Pusher(AbstractContextManager):
 
         self._push_stop_evt = threading.Event()
         self._push_thread = threading.Thread(
-            target=self._push_stream_with_gst,
+            target=self._gst_loop,
             args=(dst_ip, dst_port, use_tcp, codec, pt, ssrc_dec, self._push_stop_evt),
             daemon=True,
         )
         self._push_thread.start()
 
-    def _stop_push(self):
-        if self._push_stop_evt is not None:
-            self._push_stop_evt.set()
-            self._push_thread.join()
-            self._push_thread = None
-            self._push_stop_evt = None
-
-    # Actual GStreamer invocation
-    def _push_stream_with_gst(
-        self,
-        dst_ip: str,
-        dst_port: int,
-        use_tcp: bool,
-        codec: str,
-        pt: int,
-        ssrc_dec: Optional[int],
-        stop_evt: threading.Event,
-    ) -> None:
-        protocol = "tcp" if use_tcp else "udp"
-        ssrc_opt: List[str] = [] if ssrc_dec is None else [f"ssrc=0x{ssrc_dec:08x}"]
-        if codec == "PS":
-            gst_cmd: List[str] = [
-                "gst-launch-1.0", "-q",
-                "videotestsrc", "is-live=true",
-                "!", "video/x-raw,width=640,height=480,framerate=25/1",
-                "!", "x264enc", "key-int-max=50", "tune=zerolatency", "bitrate=800",
-                "!", "h264parse", "!", "mpegpsmux",
-                "!", "gb28181sink", f"protocol={protocol}", f"host={dst_ip}", f"port={dst_port}", f"pt={pt}", *ssrc_opt,
-            ]
-        else:  # H264 elementary
-            gst_cmd = [
-                "gst-launch-1.0", "-q",
-                "videotestsrc", "is-live=true",
-                "!", "video/x-raw,width=640,height=480,framerate=25/1",
-                "!", "x264enc", "key-int-max=50", "tune=zerolatency", "bitrate=800",
-                "!", "rtph264pay", "config-interval=-1", f"pt={pt}",
-                "!", "gb28181sink", f"protocol={protocol}", f"host={dst_ip}", f"port={dst_port}", *ssrc_opt,
-            ]
-        LOGGER.info("GStreamer cmd: %s", " ".join(gst_cmd))
+    def _gst_loop(
+            self,
+            dst_ip: str,
+            dst_port: int,
+            use_tcp: bool,
+            codec: str,
+            pt: int,
+            ssrc_dec: Optional[int],
+            stop_evt: threading.Event
+        ) -> None:
+        gst_cmd = self._make_gst_cmd(dst_ip, dst_port, use_tcp, codec, pt, ssrc_dec)
+        LOGGER.info("GStreamer cmd: %s", shlex.join(gst_cmd))
         proc = subprocess.Popen(gst_cmd)
         try:
             while not stop_evt.is_set():
@@ -541,6 +519,66 @@ class GB28181Pusher(AbstractContextManager):
             proc.terminate()
             proc.wait()
             LOGGER.info("GStreamer exited")
+
+    # Build src part based on self.source
+    def _source_elements(self) -> List[str]:
+        uri = self.source
+        if uri == "test":
+            return ["videotestsrc", "is-live=true",
+                    "!", "video/x-raw,width=640,height=480,framerate=25/1",
+                    "!", "x264enc", "key-int-max=50", "tune=zerolatency", "bitrate=500"]
+            # return ["videotestsrc", "is-live=true"]
+        if uri.startswith("rtsp://"):
+            return ["rtspsrc", f"location={uri}", "latency=0", "!", "rtph264depay"]
+        if uri.startswith("udp://"):
+            # udp://192.168.111.222:5000 or udp://:5000
+            loc = uri[6:]
+            host, _, port = loc.partition(":")
+            elements = ["udpsrc", f"port={port}"]
+            if host:
+                elements += [f"multicast-group={host}"]
+            elements += ["!", "application/x-rtp", "!", "rtph264depay"]
+            return elements
+        if uri.startswith("file://"):
+            path = uri[7:]
+            return ["filesrc", f"location={path}", "!", "qtdemux", "name=demux", "demux.video_0"]
+        if uri.startswith("v4l2://"):
+            dev = uri[7:]
+            return ["v4l2src", f"device={dev}"]
+        raise ValueError(f"Unsupported --source URI: {uri}")
+
+    def _make_gst_cmd(
+            self,
+            dst_ip: str,
+            dst_port: int,
+            use_tcp: bool,
+            codec: str,
+            pt: int,
+            ssrc_dec: Optional[int]
+    ) -> List[str]:
+        protocol = "tcp" if use_tcp else "udp"
+        ssrc_opt: List[str] = [] if ssrc_dec is None else [f"ssrc=0x{ssrc_dec:08x}"]
+        src_chain = self._source_elements()
+
+        if codec == "PS":  # mux to PS
+            pay_chain = [
+                "!", "h264parse", "!", "mpegpsmux",
+                "!", "gb28181sink", f"protocol={protocol}", f"host={dst_ip}", f"port={dst_port}", f"pt={pt}", *ssrc_opt,
+            ]
+        else:  # elementary H.264 -> RTP
+            pay_chain = [
+                "!", "videoconvert", "!", "x264enc", "key-int-max=50", "tune=zerolatency", "bitrate=800",
+                "!", "rtph264pay", "config-interval=-1", f"pt={pt}",
+                "!", "gb28181sink", f"protocol={protocol}", f"host={dst_ip}", f"port={dst_port}", *ssrc_opt,
+            ]
+        return ["gst-launch-1.0", "-q", *src_chain, *pay_chain]
+
+    def _stop_push(self):
+        if self._push_stop_evt is not None:
+            self._push_stop_evt.set()
+            self._push_thread.join()
+            self._push_thread = None
+            self._push_stop_evt = None
 
     # ------------------------------------------------------------------
     # SIP RX helpers: TCP framing & SDP parsing
@@ -646,6 +684,7 @@ def _parse_cli(argv: List[str] | None = None) -> argparse.Namespace:  # noqa: D4
     ap.add_argument("--agent-id", required=True, help="Our device ID")
     ap.add_argument("--agent-password", required=True, help="Password for Digest auth")
     ap.add_argument("--channel-id", required=True, help="Channel ID (camera) to advertise")
+    ap.add_argument("--source", default="test", help="Media source URI (default: videotestsrc)")
     ap.add_argument("--udp", action="store_true", help="Use UDP for SIP signalling instead of TCP")
     ap.add_argument("--local-ip", help="Local IP to bind (auto‑detect if omitted)")
     ap.add_argument("--verbose", action="store_true", help="Dump full SIP packets")
@@ -662,6 +701,7 @@ def main(argv: List[str] | None = None) -> None:  # noqa: D401
         agent_id=ns.agent_id,
         agent_password=ns.agent_password,
         channel_id=ns.channel_id,
+        source=ns.source,
         use_udp_signalling=ns.udp,
         local_ip=ns.local_ip,
         verbose=ns.verbose,

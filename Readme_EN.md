@@ -76,6 +76,7 @@ python3 gb28181_pusher.py \
   --server-id 11009000000000000000 --domain 1100900000 \
   --agent-id 300000000010000000000 --agent-password 000000 \
   --channel-id 340000000000000000000 \
+  --source test \
   --verbose           # dump SIP packets
 ```
 
@@ -94,7 +95,7 @@ What happens next:
 ## 🛠️ CLI Options
 
 | Option             | Default                        | Description                                        |
-| ------------------ | ------------------------------ | -------------------------------------------------- |
+| ------------------ | ------------------------------ |----------------------------------------------------|
 | `--server-ip`      | *required*                     | Platform SIP address                               |
 | `--server-port`    | `5060`                         | Platform SIP port                                  |
 | `--server-id`      | *required*                     | Platform GB ID (`PLAT_ID`)                         |
@@ -102,9 +103,20 @@ What happens next:
 | `--agent-id`       | *required*                     | Our device GB ID                                   |
 | `--agent-password` | *required*                     | Digest password                                    |
 | `--channel-id`     | *required*                     | Channel (camera) ID to advertise                   |
+| `--source`         | *test*                         | Video source                                       |
 | `--udp`            | *false*                        | Use **UDP** instead of the default **TCP** for SIP |
 | `--local-ip`       | auto‑detect                    | Local bind address                                 |
 | `--verbose`        | *false*                        | Dump debug logs & full SIP packets                 |
+
+The `--source` parameter can specify the video source:
+
+| Example                                                                 | Effect                                       |
+|-----------------------------------------------------------------------|----------------------------------------------|
+| `--source test`                                                       | Built-in `videotestsrc` (default)            |
+| `--source rtsp://admin:admin@192.168.111.222/h264/ch1/main/av_stream` | Pulls stream from an RTSP camera             |
+| `--source udp://:5000`                                                | Listens for a multicast UDP stream           |
+| `--source file://sample.mp4`                                          | Plays a local file and streams it            |
+| `--source v4l2:///dev/video0`                                         | Directly captures from a local camera        |
 
 ---
 
