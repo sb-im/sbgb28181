@@ -20,6 +20,7 @@
 | **SDP / INVITE 解析** | 按 GB28181 规范优先选择 96/PS、98/H264 等 PayloadType                |
 | **GStreamer 推流**    | 根据 SDP 动态拼装 `gst-launch-1.0` pipeline，支持 PS/H.264 及 TCP/UDP |
 | **心跳与查询响应**         | 周期 *Keepalive*，并对 *Catalog* / *DeviceInfo* 查询作出响应           |
+| **自动重连机制**          | 连接断开时自动重连，可配置重连间隔和最大重试次数                                  |
 | **日志系统**            | `--verbose` 输出完整 SIP 报文，便于抓包与调试                             |
 
 ---
@@ -91,24 +92,28 @@ python3 gb28181_pusher.py \
 3. 等待平台 **INVITE**，收到后自动 100 Trying → 200 OK 并解析 SDP。
 4. 根据 SDP 用 GStreamer 向平台指定的 IP/端口推送PS视频流。
 5. 处理 **BYE**、**MESSAGE**、**SUBSCRIBE** 并返回 200 OK。
+6. **自动重连**：当连接断开时，自动尝试重新连接和注册。
 
 ---
 
 ## 🛠️ 主要命令行参数
 
-| 参数                 | 默认                 | 说明                                |
-| ------------------ | ------------------ | --------------------------------- |
-| `--server-ip`      | *必填*               | 平台 SIP IP                         |
-| `--server-port`    | 5060               | 平台 SIP 端口                         |
-| `--server-id`      | *必填*               | 平台国标编号（`PLAT_ID`）                 |
-| `--domain`         | `server-id` 前 10 位 | SIP 域                             |
-| `--agent-id`       | *必填*               | 本设备国标编号                           |
-| `--agent-password` | *必填*               | REGISTER Digest 密码                |
-| `--channel-id`     | *必填*               | 上报给平台的通道编号                        |
-| `--source`         | *test*             | 视频源                              |
-| `--udp`            | *关闭*               | 使用 **UDP** 而非默认 **TCP** 进行 SIP 交互 |
-| `--local-ip`       | 自动探测               | 绑定本地网卡                            |
-| `--verbose`        | *关闭*               | 输出调试日志及完整 SIP 报文                  |
+| 参数                         | 默认                 | 说明                                |
+| -------------------------- | ------------------ | --------------------------------- |
+| `--server-ip`              | *必填*               | 平台 SIP IP                         |
+| `--server-port`            | 5060               | 平台 SIP 端口                         |
+| `--server-id`              | *必填*               | 平台国标编号（`PLAT_ID`）                 |
+| `--domain`                 | `server-id` 前 10 位 | SIP 域                             |
+| `--agent-id`               | *必填*               | 本设备国标编号                           |
+| `--agent-password`         | *必填*               | REGISTER Digest 密码                |
+| `--channel-id`             | *必填*               | 上报给平台的通道编号                        |
+| `--source`                 | *test*             | 视频源                              |
+| `--udp`                    | *关闭*               | 使用 **UDP** 而非默认 **TCP** 进行 SIP 交互 |
+| `--local-ip`               | 自动探测               | 绑定本地网卡                            |
+| `--verbose`                | *关闭*               | 输出调试日志及完整 SIP 报文                  |
+| `--reconnect-interval`     | 5                  | 重连间隔时间（秒）                         |
+| `--max-reconnect-attempts` | 0                  | 最大重连次数（0 = 无限重连）                  |
+| `--connection-timeout`     | 10                 | 连接超时时间（秒）                         |
 
 其中 `--source` 参数可指定视频源，支持多种格式：
 

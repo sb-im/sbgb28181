@@ -88,6 +88,10 @@ class GB28181Pusher(AbstractContextManager):
         use_udp_signalling: bool = False,
         local_ip: Optional[str] = None,
         verbose: bool = False,
+        # Reconnection parameters
+        reconnect_interval: int = 5,
+        max_reconnect_attempts: int = 0,  # 0 = infinite
+        connection_timeout: int = 10,
     ) -> None:
         self.server_ip: str = server_ip
         self.server_port: int = server_port
@@ -101,6 +105,11 @@ class GB28181Pusher(AbstractContextManager):
         self.local_ip: str = local_ip or find_local_ip(server_ip)
         self.verbose: bool = verbose
 
+        # Reconnection settings
+        self.reconnect_interval: int = reconnect_interval
+        self.max_reconnect_attempts: int = max_reconnect_attempts
+        self.connection_timeout: int = connection_timeout
+
         log_level = logging.DEBUG if verbose else logging.INFO
         logging.basicConfig(
             format="[%(asctime)s] %(levelname)s — %(message)s",
@@ -112,9 +121,17 @@ class GB28181Pusher(AbstractContextManager):
         self._send: Callable[[bytes], None]
         self._recv: Callable[[], str]
 
+        # Connection state management
+        self._connected: bool = False
+        self._shutdown_requested: bool = False
+
         # Data associated with the current media session
         self._push_thread: Optional[threading.Thread] = None
         self._push_stop_evt: Optional[threading.Event] = None
+
+        # Heartbeat thread management
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_stop_evt: Optional[threading.Event] = None
 
     # ------------------------------------------------------------
     # Public top‑level entry point
@@ -123,11 +140,53 @@ class GB28181Pusher(AbstractContextManager):
         """Open signalling socket, REGISTER to the platform, then handle
         requests forever (``Ctrl‑C`` or :pyclass:`KeyboardInterrupt` to stop).
         """
+        reconnect_count = 0
+
+        while not self._shutdown_requested:
+            try:
+                # Attempt to connect and register
+                self._connect_and_register()
+                self._connected = True
+                reconnect_count = 0  # Reset counter on successful connection
+
+                LOGGER.info("Ready — waiting for INVITE/SUBSCRIBE")
+                self._event_loop()
+
+            except KeyboardInterrupt:
+                LOGGER.info("Interrupted by user — exiting …")
+                break
+            except Exception as exc:
+                self._connected = False
+                self._stop_heartbeat()
+
+                if self._shutdown_requested:
+                    break
+
+                # Check if we should attempt reconnection
+                if self.max_reconnect_attempts > 0 and reconnect_count >= self.max_reconnect_attempts:
+                    LOGGER.error("Max reconnection attempts (%d) reached. Giving up.", self.max_reconnect_attempts)
+                    break
+
+                reconnect_count += 1
+                LOGGER.warning("Connection lost: %s. Attempting reconnection %d in %d seconds...",
+                             exc, reconnect_count, self.reconnect_interval)
+
+                # Close current socket if exists
+                if self._sock:
+                    try:
+                        self._sock.close()
+                    except:
+                        pass
+                    self._sock = None
+
+                # Wait before reconnecting
+                time.sleep(self.reconnect_interval)
+
+    def _connect_and_register(self) -> None:
+        """Connect to server and complete registration process."""
         self._open_signalling_socket()
         self._register()  # raises on failure
         self._start_heartbeat()
-        LOGGER.info("Ready — waiting for INVITE/SUBSCRIBE")
-        self._event_loop()
 
     # Context‑manager helpers so callers can ``with GB28181Pusher(...):``
     def __enter__(self):
@@ -310,8 +369,19 @@ class GB28181Pusher(AbstractContextManager):
             self._recv = self._wrap_recv(lambda: sock.recvfrom(65535)[0].decode(), "UDP←")
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((self.server_ip, self.server_port))
-            LOGGER.info("TCP signalling %s → %s:%d", sock.getsockname(), self.server_ip, self.server_port)
+            sock.settimeout(self.connection_timeout)
+            try:
+                sock.connect((self.server_ip, self.server_port))
+                LOGGER.info("TCP signalling %s → %s:%d", sock.getsockname(), self.server_ip, self.server_port)
+            except socket.timeout:
+                sock.close()
+                raise ConnectionError(f"Connection timeout after {self.connection_timeout} seconds")
+            except Exception as e:
+                sock.close()
+                raise ConnectionError(f"Failed to connect: {e}")
+
+            # Reset timeout for normal operations
+            sock.settimeout(None)
             self._send = self._wrap_send(sock.sendall, "TCP→")
             self._recv = self._wrap_recv(lambda: self._recv_tcp(sock), "TCP←")
         self._sock = sock
@@ -396,30 +466,55 @@ class GB28181Pusher(AbstractContextManager):
     # Heart‑beat thread
     # ------------------------------------------------------------------
     def _start_heartbeat(self):
+        # Stop any existing heartbeat thread
+        self._stop_heartbeat()
+
+        self._heartbeat_stop_evt = threading.Event()
+
         def _hb():
             seq = 10
             keep_xml = (
                 f"<?xml version='1.0' encoding='GB2312'?><Notify><CmdType>Keepalive</CmdType><SN>{{}}</SN>"
                 f"<DeviceID>{self.agent_id}</DeviceID><Status>OK</Status></Notify>"
             )
-            while True:
-                time.sleep(self.HB_GAP)
-                self._send(self._build_message(keep_xml.format(seq), seq, "k"))
-                seq += 1
-        threading.Thread(target=_hb, daemon=True).start()
+            while not self._heartbeat_stop_evt.is_set():
+                if self._heartbeat_stop_evt.wait(self.HB_GAP):
+                    break  # Stop event was set
+                try:
+                    if self._connected and self._send:
+                        self._send(self._build_message(keep_xml.format(seq), seq, "k"))
+                        seq += 1
+                except Exception as e:
+                    LOGGER.warning("Heartbeat send failed: %s", e)
+                    break
+
+        self._heartbeat_thread = threading.Thread(target=_hb, daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self):
+        if self._heartbeat_stop_evt:
+            self._heartbeat_stop_evt.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=1)
+        self._heartbeat_thread = None
+        self._heartbeat_stop_evt = None
 
     # ------------------------------------------------------------------
     # Main receive loop
     # ------------------------------------------------------------------
     def _event_loop(self):
-        while True:
+        while not self._shutdown_requested and self._connected:
             try:
                 pkt = self._recv()
             except socket.timeout:
                 continue
+            except ConnectionError as exc:
+                # Connection-related errors should trigger reconnection
+                LOGGER.error("Connection error in event loop: %s", exc)
+                raise
             except Exception as exc:
                 LOGGER.exception("Receive error — leaving main loop: %s", exc)
-                break
+                raise
 
             if pkt.startswith("INVITE"):
                 self._handle_invite(pkt)
@@ -664,6 +759,9 @@ class GB28181Pusher(AbstractContextManager):
     # House‑keeping
     # ------------------------------------------------------------------
     def _shutdown(self):
+        self._shutdown_requested = True
+        self._connected = False
+        self._stop_heartbeat()
         self._stop_push()
         if self._sock:
             self._sock.close()
@@ -688,6 +786,15 @@ def _parse_cli(argv: List[str] | None = None) -> argparse.Namespace:  # noqa: D4
     ap.add_argument("--udp", action="store_true", help="Use UDP for SIP signalling instead of TCP")
     ap.add_argument("--local-ip", help="Local IP to bind (auto‑detect if omitted)")
     ap.add_argument("--verbose", action="store_true", help="Dump full SIP packets")
+
+    # Reconnection options
+    ap.add_argument("--reconnect-interval", type=int, default=5,
+                   help="Seconds to wait between reconnection attempts [5]")
+    ap.add_argument("--max-reconnect-attempts", type=int, default=0,
+                   help="Maximum reconnection attempts (0 = infinite) [0]")
+    ap.add_argument("--connection-timeout", type=int, default=10,
+                   help="Connection timeout in seconds [10]")
+
     return ap.parse_args(argv)
 
 
@@ -705,6 +812,9 @@ def main(argv: List[str] | None = None) -> None:  # noqa: D401
         use_udp_signalling=ns.udp,
         local_ip=ns.local_ip,
         verbose=ns.verbose,
+        reconnect_interval=ns.reconnect_interval,
+        max_reconnect_attempts=ns.max_reconnect_attempts,
+        connection_timeout=ns.connection_timeout,
     )
     try:
         pusher.run_forever()

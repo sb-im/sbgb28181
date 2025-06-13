@@ -20,6 +20,7 @@ This repository contains a lean **GB28181** reference implementation that turns 
 | **SDP / INVITE parsing**       | Follows GB28181 rules (prefers 96/PS, 98/H264)                    |
 | **Dynamic GStreamer pipeline** | Builds a `gst-launch-1.0` pipeline on‑the‑fly (PS/H.264, TCP/UDP) |
 | **Keepalive & query replies**  | Periodic *Keepalive*, answers *Catalog* / *DeviceInfo* queries    |
+| **Auto-reconnection**          | Automatically reconnects on connection loss with configurable settings |
 | **Verbose logging**            | `--verbose` dumps full SIP packets for easy debugging             |
 
 ---
@@ -89,24 +90,28 @@ What happens next:
 3. Waits for an **INVITE**, replies `100 Trying` → `200 OK` and parses SDP.
 4. Builds an appropriate GStreamer pipeline to push PS / H.264 to the announced IP/port.
 5. Handles `BYE`, `MESSAGE`, `SUBSCRIBE` and returns `200 OK` accordingly.
+6. **Auto-reconnects**: Automatically attempts to reconnect and re-register when connection is lost.
 
 ---
 
 ## 🛠️ CLI Options
 
-| Option             | Default                        | Description                                        |
-| ------------------ | ------------------------------ |----------------------------------------------------|
-| `--server-ip`      | *required*                     | Platform SIP address                               |
-| `--server-port`    | `5060`                         | Platform SIP port                                  |
-| `--server-id`      | *required*                     | Platform GB ID (`PLAT_ID`)                         |
-| `--domain`         | first 10 digits of `server-id` | SIP domain                                         |
-| `--agent-id`       | *required*                     | Our device GB ID                                   |
-| `--agent-password` | *required*                     | Digest password                                    |
-| `--channel-id`     | *required*                     | Channel (camera) ID to advertise                   |
-| `--source`         | *test*                         | Video source                                       |
-| `--udp`            | *false*                        | Use **UDP** instead of the default **TCP** for SIP |
-| `--local-ip`       | auto‑detect                    | Local bind address                                 |
-| `--verbose`        | *false*                        | Dump debug logs & full SIP packets                 |
+| Option                         | Default                        | Description                                        |
+| ------------------------------ | ------------------------------ |----------------------------------------------------|
+| `--server-ip`                  | *required*                     | Platform SIP address                               |
+| `--server-port`                | `5060`                         | Platform SIP port                                  |
+| `--server-id`                  | *required*                     | Platform GB ID (`PLAT_ID`)                         |
+| `--domain`                     | first 10 digits of `server-id` | SIP domain                                         |
+| `--agent-id`                   | *required*                     | Our device GB ID                                   |
+| `--agent-password`             | *required*                     | Digest password                                    |
+| `--channel-id`                 | *required*                     | Channel (camera) ID to advertise                   |
+| `--source`                     | *test*                         | Video source                                       |
+| `--udp`                        | *false*                        | Use **UDP** instead of the default **TCP** for SIP |
+| `--local-ip`                   | auto‑detect                    | Local bind address                                 |
+| `--verbose`                    | *false*                        | Dump debug logs & full SIP packets                 |
+| `--reconnect-interval`         | `5`                            | Seconds to wait between reconnection attempts      |
+| `--max-reconnect-attempts`     | `0`                            | Maximum reconnection attempts (0 = infinite)       |
+| `--connection-timeout`         | `10`                           | Connection timeout in seconds                       |
 
 The `--source` parameter can specify the video source:
 
